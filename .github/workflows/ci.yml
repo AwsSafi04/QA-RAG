@@ -32,6 +32,7 @@ jobs:
           push: false
           load: true              # load image into local Docker daemon so we can run it
           tags: rag-qa-system:test
+          no-cache: true
 
       - name: Test Docker image
         run: |
