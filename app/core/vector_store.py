@@ -39,7 +39,6 @@ def get_qdrant_client() -> QdrantClient:
     return client
 
 
-
 class VectorStoreService:
     """Service for managing vector store operations."""
 
@@ -63,7 +62,9 @@ class VectorStoreService:
             embedding=self.embeddings,
         )
 
-        logger.info(f"VectorStoreService initialized for collection: {self.collection_name}")
+        logger.info(
+            f"VectorStoreService initialized for collection: {self.collection_name}"
+        )
 
     def _ensure_collection(self) -> None:
         """Ensure the collection exists, create if not."""

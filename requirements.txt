@@ -4,11 +4,14 @@ uvicorn[standard]
 python-multipart
 
 # LangChain & AI
-langchain
-langchain-openai
-langchain-qdrant
-langchain-community
-langchain-text-splitters
+# Pinned to the 0.3.x line — ragas 0.3.7 is incompatible with LangChain v1.x
+# (langchain-community 0.4+ removed chat_models.vertexai, which ragas imports).
+langchain==0.3.30
+langchain-core==0.3.86
+langchain-openai==0.3.35
+langchain-qdrant==0.2.1
+langchain-community==0.3.31
+langchain-text-splitters==0.3.11
 
 # Vector Database
 qdrant-client
