@@ -11,8 +11,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 
 from app import __version__
 from app.api.routes import documents, health, query
@@ -72,13 +71,12 @@ app.add_middleware(
 )
 
 # Mount static files
-#app.mount("/static", StaticFiles(directory="static"), name="static")
+# app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # Include routers
 app.include_router(health.router)
 app.include_router(documents.router)
 app.include_router(query.router)
-
 
 
 @app.get("/", tags=["Root"])

@@ -1,8 +1,8 @@
 # ==================================================
-# RAG Q&A System - CD Pipeline (ECR + App Runner)
+# RAG Q&A System - CD Pipeline (ECR + EC2 via SSH)
 # ==================================================
 
-name: CD - Deploy to AWS
+name: CD - Deploy to EC2
 
 on:
   push:
@@ -12,7 +12,9 @@ on:
 env:
   AWS_REGION: eu-central-1
   ECR_REPOSITORY: qa-rag-p1
-  APP_RUNNER_SERVICE: rag-qa-app-p1
+  CONTAINER_NAME: rag-qa-api
+  HOST_PORT: "80"          # Port exposed on the EC2 instance
+  CONTAINER_PORT: "8000"   # Port the app listens on inside the container
 
 jobs:
   # ============================================
@@ -53,23 +55,20 @@ jobs:
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
-          # Output the image URI
+          # Output the image URI (immutable, SHA-tagged — used for deploy/rollback)
           echo "image_uri=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
 
           echo "✅ Image pushed: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
 
   # ============================================
-  # Deploy to App Runner
+  # Deploy to EC2 over SSH
   # ============================================
   deploy:
-    name: Deploy to App Runner
+    name: Deploy to EC2
     runs-on: ubuntu-latest
     needs: build-and-push
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -77,169 +76,118 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Check if App Runner service exists
-        id: check-service
-        run: |
-          SERVICE_ARN=$(aws apprunner list-services --region ${{ env.AWS_REGION }} \
-            --query "ServiceSummaryList[?ServiceName=='${{ env.APP_RUNNER_SERVICE }}'].ServiceArn" \
-            --output text)
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
-          if [ -z "$SERVICE_ARN" ]; then
-            echo "exists=false" >> $GITHUB_OUTPUT
-            echo "Service does not exist - will create new service"
-          else
-            echo "exists=true" >> $GITHUB_OUTPUT
-            echo "service_arn=$SERVICE_ARN" >> $GITHUB_OUTPUT
-            echo "Service exists: $SERVICE_ARN"
+      - name: Get short-lived ECR password
+        id: ecr-pw
+        run: |
+          # Generate a temporary ECR auth token and mask it in the logs.
+          # It is forwarded to the instance so it can pull without long-lived creds.
+          PW=$(aws ecr get-login-password --region "${{ env.AWS_REGION }}")
+          echo "::add-mask::$PW"
+          echo "ECR_PASSWORD=$PW" >> "$GITHUB_ENV"
+
+      - name: Whitelist runner IP for SSH
+        run: |
+          # Open port 22 to just this runner's public IP for the duration of the deploy.
+          RUNNER_IP=$(curl -s https://checkip.amazonaws.com)
+          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
+          echo "Opening SSH (22) for runner IP: $RUNNER_IP"
+          aws ec2 authorize-security-group-ingress \
+            --group-id ${{ secrets.EC2_SECURITY_GROUP_ID }} \
+            --protocol tcp --port 22 --cidr "${RUNNER_IP}/32" \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Deploy container on EC2
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          IMAGE_URI: ${{ needs.build-and-push.outputs.image_uri }}
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_PASSWORD: ${{ env.ECR_PASSWORD }}
+          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
+          HOST_PORT: ${{ env.HOST_PORT }}
+          CONTAINER_PORT: ${{ env.CONTAINER_PORT }}
+          # App secrets/config — injected into a locked-down env file on the host
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          QDRANT_URL: ${{ secrets.QDRANT_URL }}
+          QDRANT_API_KEY: ${{ secrets.QDRANT_API_KEY }}
+          LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          # Forward these env vars into the remote shell
+          envs: IMAGE_URI,ECR_REGISTRY,ECR_PASSWORD,CONTAINER_NAME,HOST_PORT,CONTAINER_PORT,OPENAI_API_KEY,QDRANT_URL,QDRANT_API_KEY,LANGSMITH_API_KEY
+          script: |
+            set -euo pipefail
+
+            echo "🔐 Logging in to ECR..."
+            echo "$ECR_PASSWORD" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+            echo "⬇️  Pulling image: $IMAGE_URI"
+            docker pull "$IMAGE_URI"
+
+            echo "📝 Writing environment file..."
+            ENV_FILE="$HOME/${CONTAINER_NAME}.env"
+            umask 077   # file readable only by the current user
+            cat > "$ENV_FILE" <<EOF
+            OPENAI_API_KEY=$OPENAI_API_KEY
+            QDRANT_URL=$QDRANT_URL
+            QDRANT_API_KEY=$QDRANT_API_KEY
+            LOG_LEVEL=INFO
+            LANGSMITH_TRACING=true
+            LANGSMITH_API_KEY=$LANGSMITH_API_KEY
+            LANGSMITH_PROJECT=rag-qa-production
+            LANGSMITH_ENDPOINT=https://eu.api.smith.langchain.com
+            EOF
+
+            echo "🔄 Restarting container..."
+            docker stop "$CONTAINER_NAME" 2>/dev/null || true
+            docker rm "$CONTAINER_NAME" 2>/dev/null || true
+
+            docker run -d \
+              --name "$CONTAINER_NAME" \
+              --restart unless-stopped \
+              -p "${HOST_PORT}:${CONTAINER_PORT}" \
+              --env-file "$ENV_FILE" \
+              "$IMAGE_URI"
+
+            echo "🧹 Removing old images for this repo (keeping the one just deployed)..."
+            REPO="${IMAGE_URI%:*}"   # strip the :tag → registry/repository
+            docker image ls "$REPO" --format '{{.Repository}}:{{.Tag}}' \
+              | grep -vx "$IMAGE_URI" \
+              | xargs -r docker rmi -f || true
+            docker image prune -f    # sweep any now-dangling layers
+
+            echo "✅ Deployed $IMAGE_URI as container '$CONTAINER_NAME'"
+
+      - name: Revoke runner IP from SSH
+        if: always()   # always close the door, even if the deploy failed
+        run: |
+          if [ -n "${RUNNER_IP:-}" ]; then
+            echo "Closing SSH (22) for runner IP: $RUNNER_IP"
+            aws ec2 revoke-security-group-ingress \
+              --group-id ${{ secrets.EC2_SECURITY_GROUP_ID }} \
+              --protocol tcp --port 22 --cidr "${RUNNER_IP}/32" \
+              --region ${{ env.AWS_REGION }} || true
           fi
 
-      - name: Create App Runner service (if not exists)
-        if: steps.check-service.outputs.exists == 'false'
-        id: create-service
+      - name: Health check
         run: |
-          aws apprunner create-service \
-            --service-name ${{ env.APP_RUNNER_SERVICE }} \
-            --region ${{ env.AWS_REGION }} \
-            --source-configuration '{
-              "ImageRepository": {
-                "ImageIdentifier": "${{ needs.build-and-push.outputs.image_uri }}",
-                "ImageRepositoryType": "ECR",
-                "ImageConfiguration": {
-                  "Port": "8000",
-                  "RuntimeEnvironmentVariables": {
-                    "OPENAI_API_KEY": "${{ secrets.OPENAI_API_KEY }}",
-                    "QDRANT_URL": "${{ secrets.QDRANT_URL }}",
-                    "QDRANT_API_KEY": "${{ secrets.QDRANT_API_KEY }}",
-                    "LOG_LEVEL": "INFO",
-                    "LANGSMITH_TRACING": "true",
-                    "LANGSMITH_API_KEY": "${{ secrets.LANGSMITH_API_KEY }}",
-                    "LANGSMITH_PROJECT": "rag-qa-production-system",
-                    "LANGSMITH_ENDPOINT": "https://eu.api.smith.langchain.com"
-                  }
-                }
-              },
-              "AuthenticationConfiguration": {
-                "AccessRoleArn": "${{ secrets.APP_RUNNER_ECR_ACCESS_ROLE_ARN }}"
-              },
-              "AutoDeploymentsEnabled": false
-            }' \
-            --instance-configuration '{
-              "Cpu": "1 vCPU",
-              "Memory": "2 GB"
-            }' \
-            --health-check-configuration '{
-              "Protocol": "HTTP",
-              "Path": "/health",
-              "Interval": 10,
-              "Timeout": 5,
-              "HealthyThreshold": 1,
-              "UnhealthyThreshold": 5
-            }' \
-            --output json > service-output.json
-
-          SERVICE_ARN=$(cat service-output.json | jq -r '.Service.ServiceArn')
-          SERVICE_URL=$(cat service-output.json | jq -r '.Service.ServiceUrl')
-
-          echo "service_arn=$SERVICE_ARN" >> $GITHUB_OUTPUT
-          echo "service_url=$SERVICE_URL" >> $GITHUB_OUTPUT
-          echo "✅ Service created: $SERVICE_ARN"
-
-      - name: Update App Runner service (if exists)
-        if: steps.check-service.outputs.exists == 'true'
-        id: update-service
-        run: |
-          aws apprunner update-service \
-            --service-arn ${{ steps.check-service.outputs.service_arn }} \
-            --region ${{ env.AWS_REGION }} \
-            --source-configuration '{
-              "ImageRepository": {
-                "ImageIdentifier": "${{ needs.build-and-push.outputs.image_uri }}",
-                "ImageRepositoryType": "ECR",
-                "ImageConfiguration": {
-                  "Port": "8000",
-                  "RuntimeEnvironmentVariables": {
-                    "OPENAI_API_KEY": "${{ secrets.OPENAI_API_KEY }}",
-                    "QDRANT_URL": "${{ secrets.QDRANT_URL }}",
-                    "QDRANT_API_KEY": "${{ secrets.QDRANT_API_KEY }}",
-                    "LOG_LEVEL": "INFO",
-                    "LANGSMITH_TRACING": "true",
-                    "LANGSMITH_API_KEY": "${{ secrets.LANGSMITH_API_KEY }}",
-                    "LANGSMITH_PROJECT": "rag-qa-production-system",
-                    "LANGSMITH_ENDPOINT": "https://eu.api.smith.langchain.com"
-                  }
-                }
-              },
-              "AuthenticationConfiguration": {
-                "AccessRoleArn": "${{ secrets.APP_RUNNER_ECR_ACCESS_ROLE_ARN }}"
-              },
-              "AutoDeploymentsEnabled": false
-            }' \
-            --output json > service-output.json
-
-          SERVICE_ARN=$(cat service-output.json | jq -r '.Service.ServiceArn')
-          SERVICE_URL=$(cat service-output.json | jq -r '.Service.ServiceUrl')
-
-          echo "service_arn=$SERVICE_ARN" >> $GITHUB_OUTPUT
-          echo "service_url=$SERVICE_URL" >> $GITHUB_OUTPUT
-          echo "✅ Service updated: $SERVICE_ARN"
-
-      - name: Wait for service to be ready
-        run: |
-          if [ "${{ steps.check-service.outputs.exists }}" == "false" ]; then
-            SERVICE_ARN="${{ steps.create-service.outputs.service_arn }}"
-          else
-            SERVICE_ARN="${{ steps.update-service.outputs.service_arn }}"
-          fi
-
-          echo "Waiting for service to be ready: $SERVICE_ARN"
-
-          # Poll service status until it's RUNNING
-          MAX_ATTEMPTS=60
-          ATTEMPT=0
-
-          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
-            STATUS=$(aws apprunner describe-service \
-              --service-arn $SERVICE_ARN \
-              --region ${{ env.AWS_REGION }} \
-              --query 'Service.Status' \
-              --output text)
-
-            echo "Current status: $STATUS (attempt $((ATTEMPT + 1))/$MAX_ATTEMPTS)"
-
-            if [ "$STATUS" == "RUNNING" ]; then
-              echo "✅ Service is running and ready!"
+          echo "Waiting for the app to come up..."
+          sleep 20
+          URL="http://${{ secrets.EC2_HOST }}:${{ env.HOST_PORT }}/health"
+          echo "Checking health at: $URL"
+          for i in 1 2 3 4 5; do
+            if curl -fsS "$URL"; then
+              echo ""
+              echo "✅ Health check passed!"
               exit 0
-            elif [ "$STATUS" == "CREATE_FAILED" ] || [ "$STATUS" == "UPDATE_FAILED" ]; then
-              echo "❌ Service deployment failed with status: $STATUS"
-              exit 1
             fi
-
+            echo "Attempt $i failed, retrying in 10s..."
             sleep 10
-            ATTEMPT=$((ATTEMPT + 1))
           done
-
-          echo "❌ Timeout waiting for service to be ready"
+          echo "❌ Health check did not pass after retries"
           exit 1
-
-      - name: Get Service URL
-        id: get-url
-        run: |
-          if [ "${{ steps.check-service.outputs.exists }}" == "false" ]; then
-            SERVICE_URL="${{ steps.create-service.outputs.service_url }}"
-          else
-            SERVICE_URL="${{ steps.update-service.outputs.service_url }}"
-          fi
-          echo "service_url=$SERVICE_URL" >> $GITHUB_OUTPUT
-          echo "Service URL: $SERVICE_URL"
-
-      - name: Output App Runner URL
-        run: |
-          echo "🚀 Deployment successful!"
-          echo "App Runner Service URL: https://${{ steps.get-url.outputs.service_url }}"
-
-      - name: Health Check
-        run: |
-          sleep 30
-          SERVICE_URL="${{ steps.get-url.outputs.service_url }}"
-          echo "Checking health at: https://$SERVICE_URL/health"
-          curl -f "https://$SERVICE_URL/health" || echo "Health check pending..."

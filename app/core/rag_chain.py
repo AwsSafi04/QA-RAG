@@ -14,7 +14,6 @@ logger = get_logger(__name__)
 settings = get_settings()
 
 
-
 # RAG Prompt Template
 RAG_PROMPT_TEMPLATE = """You are a helpful assistant. Answer the question based on the provided context.
 
@@ -40,7 +39,6 @@ def format_docs(docs: list[Document]) -> str:
         Formatted context string
     """
     return "\n\n---\n\n".join(doc.page_content for doc in docs)
-
 
 
 class RAGChain:
@@ -213,7 +211,9 @@ class RAGChain:
             logger.error(f"Error processing async query with sources: {e}")
             raise
 
-    async def aquery_with_evaluation(self, question: str, include_sources: bool = True) -> dict:
+    async def aquery_with_evaluation(
+        self, question: str, include_sources: bool = True
+    ) -> dict:
         """Execute async RAG query with RAGAS evaluation.
 
         Args:

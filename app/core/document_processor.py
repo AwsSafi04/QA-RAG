@@ -15,7 +15,6 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from app.config import get_settings
 from app.utils.logger import get_logger
 
-
 logger = get_logger(__name__)
 
 
@@ -50,8 +49,7 @@ class DocumentProcessor:
             f"DocumentProcessor initialized with chunk_size={self.chunk_size}, "
             f"chunk_overlap={self.chunk_overlap}"
         )
-    
-    
+
     def load_pdf(self, file_path: str | Path) -> list[Document]:
         """Load a PDF file.
 
@@ -69,7 +67,6 @@ class DocumentProcessor:
 
         logger.info(f"Loaded {len(documents)} pages from {file_path.name}")
         return documents
-
 
     def load_text(self, file_path: str | Path) -> list[Document]:
         """Load a text file.
@@ -106,7 +103,6 @@ class DocumentProcessor:
 
         logger.info(f"Loaded {len(documents)} rows from {file_path.name}")
         return documents
-
 
     def load_file(self, file_path: str | Path) -> list[Document]:
         """Load a file based on its extension.
@@ -179,7 +175,6 @@ class DocumentProcessor:
             # Clean up temp file
             Path(tmp_path).unlink(missing_ok=True)
 
-
     def split_documents(self, documents: list[Document]) -> list[Document]:
         """Split documents into chunks.
 
@@ -196,7 +191,6 @@ class DocumentProcessor:
         logger.info(f"Created {len(chunks)} chunks")
         return chunks
 
-
     def process_file(self, file_path: str | Path) -> list[Document]:
         """Load and split a file in one step.
 
@@ -208,7 +202,6 @@ class DocumentProcessor:
         """
         documents = self.load_file(file_path)
         return self.split_documents(documents)
-
 
     def process_upload(
         self,

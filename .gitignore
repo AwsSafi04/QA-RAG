@@ -48,8 +48,10 @@ env/
 # Testing
 .pytest_cache/
 .coverage
+coverage.xml
 htmlcov/
 .tox/
+.ruff_cache/
 
 # mypy
 .mypy_cache/
